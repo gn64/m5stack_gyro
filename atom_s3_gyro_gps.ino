@@ -36,10 +36,9 @@
  #define GYRO_LOG_INTERVAL 1000    // ジャイロセンサー取得間隔（us）- 1000Hz
  #define DISPLAY_UPDATE_INTERVAL 5000 // 画面更新間隔（ms）
  #define BATTERY_SAVE_DELAY 30000    // 省電力モードに入るまでの非アクティブ時間（ms）
- #define GYRO_BUFFER_SIZE 1000      // ジャイロデータバッファサイズ
- #define LOG_FILENAME "/GYRODATA.CSV" // Gyroflow互換ログファイル名
  #define KEEP_ALIVE_INTERVAL 25000    // TailBATの自動電源オフ防止間隔（ms）- 30秒以内
  #define KEEP_ALIVE_PIN 38            // 負荷をかけるためのピン
+ #define GYRO_BUFFER_SIZE 1000
  
  // メニュー関連定数
  #define MENU_NONE 0
@@ -63,6 +62,11 @@
  bool displayOn = true;
  bool recordingActive = false;
  unsigned long recordStartTime = 0;
+ File gpsLogFile;
+ char gyroPath[64];
+ char gpsPath[64];
+ uint16_t unkGyroIndex = 1;
+ uint16_t unkGpsIndex  = 1;
  
  // センサー状態管理
  bool gyroEnabled = true;     // ジャイロセンサーの有効/無効状態
@@ -88,6 +92,34 @@
  GyroData gyroBuffer[GYRO_BUFFER_SIZE];
  int bufferIndex = 0;
  bool bufferFull = false;
+ 
+ void buildLogPaths() {
+   struct tm tmNow;
+   if (timeSet && getLocalTime(&tmNow)) {              // 時計が合っている&#8203;:contentReference[oaicite:2]{index=2}
+     strftime(gyroPath, sizeof(gyroPath),
+              "/GYRO/%Y-%m-%d/%H_%M_%S.csv", &tmNow);
+     strftime(gpsPath , sizeof(gpsPath ),
+              "/GPS/%Y-%m-%d/%H_%M_%S.csv", &tmNow);
+   } else {                                            // 未同期 → UNK_連番
+     sprintf(gyroPath, "/GYRO/UNK_%04u.csv", unkGyroIndex++);
+     sprintf(gpsPath , "/GPS/UNK_%04u.csv",  unkGpsIndex++);
+   }
+ }
+ 
+ void ensureDir(const char *filepath) {
+   // 例: /GYRO/2025-04-24/14_03_51.csv → "/GYRO/2025-04-24"
+   String path = String(filepath);
+   int last = path.lastIndexOf('/');
+   if (last <= 0) return;
+   String dir = path.substring(0, last);
+   // 階層ごとに mkdir (ESP32 では再帰 mkdir は自前で)&#8203;:contentReference[oaicite:3]{index=3}
+   int pos = 1;                       // 先頭 '/'
+   while ((pos = dir.indexOf('/', pos)) >= 0) {
+     SD.mkdir(dir.substring(0, pos).c_str());
+     pos++;                           // 次へ
+   }
+   SD.mkdir(dir.c_str());             // 最下層
+ }
  
  // メニュー処理関数
  void handleMenu() {
@@ -193,15 +225,19 @@
  // 録画開始処理
  void startRecording() {
    recordStartTime = millis();
-   
-   // 新しいファイルを作成
-   if (sdCardAvailable) {
-     // 既存ファイルがあれば削除
-     if (SD.exists(LOG_FILENAME)) {
-       SD.remove(LOG_FILENAME);
-     }
-     writeGyroflowCsvHeader();
-   }
+   buildLogPaths();           // ←★追加: パス生成
+   ensureDir(gyroPath);       // ←★追加
+   ensureDir(gpsPath);        // ←★追加
+ 
+   /*------- Gyro CSV ----------*/
+   logFile = SD.open(gyroPath, FILE_WRITE);
+   if (!logFile) { Serial.println("Gyro file open error!"); }
+   else           { logFile.println("timestamp,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z"); }
+ 
+   /*------- GPS CSV ----------*/
+   gpsLogFile = SD.open(gpsPath, FILE_WRITE);
+   if (!gpsLogFile) { Serial.println("GPS file open error!"); }
+   else             { gpsLogFile.println("timestamp,lat,lon,alt,num_sats"); }
    
    // バッファをリセット
    bufferIndex = 0;
@@ -219,7 +255,8 @@
  void stopRecording() {
    // バッファの残りを書き込み
    writeGyroBufferToSD();
-   
+   if (logFile     ) logFile.close();
+   if (gpsLogFile  ) gpsLogFile.close();
    Serial.println("Recording stopped");
  }// メインメニューを表示する関数
  void showMainMenu() {
@@ -528,62 +565,22 @@
    }
  }
  
- // Gyroflow互換のCSVヘッダーを書き込む関数
- void writeGyroflowCsvHeader() {
-   if (!sdCardAvailable) return;
-   
-   logFile = SD.open(LOG_FILENAME, FILE_WRITE);
-   if (!logFile) {
-     Serial.println("Error opening log file!");
-     return;
-   }
-   
-   // Gyroflow互換のCSVヘッダー
-   logFile.println("timestamp,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z");
-   logFile.close();
-   
-   Serial.print("Log file created: ");
-   Serial.println(LOG_FILENAME);
- }
- 
  // バッファリングしたジャイロデータをSDカードに書き込む関数
  void writeGyroBufferToSD() {
-   if (!sdCardAvailable || (!bufferFull && bufferIndex == 0)) return;
-   
-   logFile = SD.open(LOG_FILENAME, FILE_APPEND);
-   if (!logFile) {
-     Serial.println("Error opening log file!");
-     return;
+   if (!recordingActive || !logFile) return;
+   int cnt = bufferFull ? GYRO_BUFFER_SIZE : bufferIndex;
+   int start = bufferFull ? bufferIndex : 0;
+ 
+   for (int i = 0; i < cnt; ++i) {
+     int idx = (start + i) % GYRO_BUFFER_SIZE;
+     logFile.printf("%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                    (long long)gyroBuffer[idx].timestamp,
+                    gyroBuffer[idx].gyroX, gyroBuffer[idx].gyroY, gyroBuffer[idx].gyroZ,
+                    gyroBuffer[idx].accX, gyroBuffer[idx].accY, gyroBuffer[idx].accZ);
    }
-   
-   // バッファ内のデータを書き込み
-   int count = bufferFull ? GYRO_BUFFER_SIZE : bufferIndex;
-   int startIdx = bufferFull ? bufferIndex : 0;
-   
-   for (int i = 0; i < count; i++) {
-     int idx = (startIdx + i) % GYRO_BUFFER_SIZE;
-     
-     // Gyroflowフォーマットでデータを書き込み
-     logFile.print(gyroBuffer[idx].timestamp);
-     logFile.print(",");
-     logFile.print(gyroBuffer[idx].gyroX, 6);
-     logFile.print(",");
-     logFile.print(gyroBuffer[idx].gyroY, 6);
-     logFile.print(",");
-     logFile.print(gyroBuffer[idx].gyroZ, 6);
-     logFile.print(",");
-     logFile.print(gyroBuffer[idx].accX, 6);
-     logFile.print(",");
-     logFile.print(gyroBuffer[idx].accY, 6);
-     logFile.print(",");
-     logFile.println(gyroBuffer[idx].accZ, 6);
-   }
-   
-   logFile.close();
-   
-   // バッファをリセット
+   logFile.flush();           // ファイルは開き直さずフラッシュのみ :contentReference[oaicite:0]{index=0}
    bufferIndex = 0;
-   bufferFull = false;
+   bufferFull  = false;
  }
  
  // 画面に情報を表示する関数
@@ -706,7 +703,6 @@
    sdCardAvailable = SD.begin();
    if (sdCardAvailable) {
      Serial.println("SD Card initialized");
-     writeGyroflowCsvHeader();
      M5.Lcd.println("SD: OK");
    } else {
      Serial.println("SD Card initialization failed");
@@ -730,6 +726,8 @@
  
  // メインループ
  void loop() {
+   static bool newGpsDataReceived = false;
+   newGpsDataReceived = false;
    M5.update();  // ボタン状態更新
    
    unsigned long currentMillis = millis();
@@ -789,6 +787,15 @@
          writeGyroBufferToSD();
        }
      }
+   }
+   if (newGpsDataReceived && recordingActive && gpsLogFile) {
+   int64_t ts = getCurrentMicros();
+   gpsLogFile.printf("%lld,%.6f,%.6f,%.2f,%u\n",
+                     (long long)ts,
+                     gps.location.lat(), gps.location.lng(),
+                     gps.altitude.meters(),
+                     gps.satellites.isValid() ? gps.satellites.value() : 0);
+   gpsLogFile.flush();
    }
    
    // 画面の定期的な更新（メニュー表示中でない場合）
